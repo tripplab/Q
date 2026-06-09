@@ -1,32 +1,63 @@
 #!/usr/bin/env Rscript
 
 ###############################################################################
-# MCEV Project-specific Q-methodology workflow around qmethod by trippm@tripplab.com
+# Transparent, reproducible Q-methodology workflow around the R package qmethod
+# by trippm@tripplab.com on 090626
 #
-# Workflow:
-# 1. Read CSV
-# 2. Validate 49 statements and forced distribution
-# 3. Separate metadata from numeric Q-sort matrix
-# 4. Run qmethod for 1F, 2F, 3F, and 4F
-# 5. Export loadings
-# 6. Export factor arrays
-# 7. Export distinguishing / consensus statements where applicable
-# 8. Generate a strict LaTeX solution-comparison report
+# Purpose:
+#   This script reads a project-specific Q-sort CSV file, validates the forced
+#   distribution, runs qmethod solutions with 1, 2, 3, and 4 factors, exports
+#   loadings, defining sorts, factor arrays, distinguishing/consensus statements,
+#   and generates a strict LaTeX solution-comparison report.
 #
-# Expected input CSV columns:
-# statement_id, statement_text, category, P1, P2, P3, P4, P5, P6, P7, P8
+# Expected input CSV format:
+#
+#   statement_id, statement_text, category, P1, P2, P3, P4, P5, P6, P7, P8
+#
+# Expected Q-sort design:
+#
+#   -6  
+#   -5  -5  
+#   -4  -4  -4  
+#   -3  -3  -3  -3
+#   -2  -2  -2  -2  -2  
+#   -1  -1  -1  -1  -1  -1
+#    0   0   0   0   0   0   0
+#    1   1   1   1   1   1
+#    2   2   2   2   2
+#    3   3   3   3
+#    4   4   4
+#    5   5
+#    6
+#
+# Important patch relative to the earlier version:
+#   The qmethod package can return a non-table qdc component for a 1-factor
+#   solution because distinguishing/consensus statements are not defined when
+#   there is only one factor. Calling print(result) or summary(result) may then
+#   crash through print.QmethodRes().
+#
+#   Therefore, this script NEVER directly calls print(result) or summary(result)
+#   on the qmethod object. It extracts and writes components manually instead.
+#
 ###############################################################################
 
 ###############################################################################
 # 0. USER SETTINGS
 ###############################################################################
 
-input_file <- "Qsort_results.csv"
-output_dir <- "qresults"
+# Path to the input CSV file.
+input_file <- "data/qsort_data.csv"
 
+# Main output directory.
+output_dir <- "outputs"
+
+# Expected number of statements.
 expected_n_statements <- 49L
+
+# Expected participant columns.
 expected_participants <- paste0("P", 1:8)
 
+# Forced Q-sort distribution.
 expected_distribution <- c(
   rep(-6, 1),
   rep(-5, 2),
@@ -43,11 +74,24 @@ expected_distribution <- c(
   rep( 6, 1)
 )
 
+# Factor solutions to run.
 factor_solutions <- 1:4
+
+# qmethod settings.
+#
+# PCA is used as the default extraction method.
+# Varimax is used for all solutions, including 1F, because qmethod accepts
+# varimax as a standard rotation argument. For 1F, rotation has no substantive
+# interpretive role, but using varimax avoids nonstandard-rotation warnings
+# caused by passing rotation = "none".
 extraction_method <- "PCA"
-rotation_method_multi_factor <- "varimax"
+rotation_method <- "varimax"
 correlation_method <- "pearson"
 
+# Factor-loading significance threshold.
+# For 49 statements:
+#   SE = 1 / sqrt(49) = 0.143
+#   p < 0.01 threshold = 2.58 / sqrt(49) = 0.369
 loading_significance_threshold <- 2.58 / sqrt(expected_n_statements)
 
 ###############################################################################
@@ -67,7 +111,7 @@ if (length(missing_packages) > 0) {
       paste(missing_packages, collapse = ", "),
       "\nInstall them with:\n",
       "install.packages(c(",
-      paste(sprintf('\"%s\"', missing_packages), collapse = ", "),
+      paste(sprintf("\"%s\"", missing_packages), collapse = ", "),
       "))"
     ),
     call. = FALSE
@@ -97,10 +141,11 @@ for (d in subdirs) {
 }
 
 ###############################################################################
-# 3. HELPER FUNCTIONS
+# 3. GENERAL HELPER FUNCTIONS
 ###############################################################################
 
-write_csv <- function(x, path, row.names = FALSE) {
+# Write a CSV using UTF-8 encoding.
+write_csv_utf8 <- function(x, path, row.names = FALSE) {
   utils::write.csv(
     x,
     file = path,
@@ -110,25 +155,61 @@ write_csv <- function(x, path, row.names = FALSE) {
   )
 }
 
-get_component <- function(result, name, index) {
+# Capture object printing safely.
+# This prevents a printing method from crashing the whole analysis.
+safe_capture_print <- function(x) {
+  out <- tryCatch(
+    {
+      capture.output(print(x))
+    },
+    error = function(e) {
+      c(
+        "Printing failed.",
+        paste0("Error: ", conditionMessage(e))
+      )
+    }
+  )
+  out
+}
+
+# Extract a component from a qmethod result.
+# qmethod objects are lists, but package versions may differ slightly.
+# This function first tries by name, then by list index as fallback.
+get_component <- function(result, name, index = NULL) {
   if (!is.null(result[[name]])) {
     return(result[[name]])
   }
-  if (length(result) >= index) {
+
+  if (!is.null(index) && length(result) >= index) {
     return(result[[index]])
   }
+
   return(NULL)
 }
 
+# Convert object to data frame if possible.
 safe_as_data_frame <- function(x) {
   if (is.null(x)) {
     return(NULL)
   }
-  as.data.frame(x, stringsAsFactors = FALSE)
+
+  out <- tryCatch(
+    {
+      as.data.frame(x, stringsAsFactors = FALSE)
+    },
+    error = function(e) {
+      NULL
+    }
+  )
+
+  return(out)
 }
 
-select_numeric_factor_columns <- function(x, nfactors) {
+# Select the first nfactors numeric columns from a qmethod component.
+# This is useful for loadings, z-scores, and rounded factor scores.
+select_numeric_factor_columns <- function(x, nfactors, prefix = "F") {
   x <- safe_as_data_frame(x)
+
   if (is.null(x)) {
     return(NULL)
   }
@@ -136,204 +217,16 @@ select_numeric_factor_columns <- function(x, nfactors) {
   numeric_cols <- vapply(x, is.numeric, logical(1))
 
   if (sum(numeric_cols) < nfactors) {
-    stop(
-      "Could not identify enough numeric factor columns in qmethod output.",
-      call. = FALSE
-    )
-  }
-
-  out <- x[, which(numeric_cols)[seq_len(nfactors)], drop = FALSE]
-  names(out) <- paste0("F", seq_len(nfactors))
-  out
-}
-
-as_logical_matrix <- function(x, nrow_expected, ncol_expected, row_names, col_names) {
-  if (is.null(x)) {
-    out <- matrix(
-      FALSE,
-      nrow = nrow_expected,
-      ncol = ncol_expected,
-      dimnames = list(row_names, col_names)
-    )
-    return(out)
-  }
-
-  x <- as.data.frame(x, stringsAsFactors = FALSE)
-
-  if (ncol(x) < ncol_expected) {
-    out <- matrix(
-      FALSE,
-      nrow = nrow_expected,
-      ncol = ncol_expected,
-      dimnames = list(row_names, col_names)
-    )
-    return(out)
-  }
-
-  x <- x[, seq_len(ncol_expected), drop = FALSE]
-  out <- as.matrix(x)
-
-  storage.mode(out) <- "logical"
-
-  rownames(out) <- row_names
-  colnames(out) <- col_names
-
-  out
-}
-
-fallback_flags_from_loadings <- function(loadings_numeric, threshold) {
-  abs_loadings <- abs(as.matrix(loadings_numeric))
-  significant <- abs_loadings >= threshold
-
-  out <- matrix(
-    FALSE,
-    nrow = nrow(significant),
-    ncol = ncol(significant),
-    dimnames = dimnames(significant)
-  )
-
-  for (i in seq_len(nrow(significant))) {
-    sig_idx <- which(significant[i, ])
-
-    if (length(sig_idx) == 1) {
-      out[i, sig_idx] <- TRUE
-    } else if (length(sig_idx) > 1) {
-      max_idx <- which.max(abs_loadings[i, ])
-      out[i, sig_idx] <- TRUE
-
-      if (length(sig_idx) > 1) {
-        out[i, sig_idx] <- TRUE
-      }
-    }
-  }
-
-  out
-}
-
-classify_defining_sorts <- function(loadings_numeric, flagged_matrix) {
-  participant <- rownames(loadings_numeric)
-  factor_names <- colnames(loadings_numeric)
-
-  flag_count <- rowSums(flagged_matrix, na.rm = TRUE)
-
-  status <- ifelse(
-    flag_count == 0,
-    "non_defining",
-    ifelse(flag_count == 1, "defining", "confounded")
-  )
-
-  defining_factor <- rep(NA_character_, length(participant))
-  defining_loading <- rep(NA_real_, length(participant))
-  loading_sign <- rep(NA_character_, length(participant))
-
-  for (i in seq_along(participant)) {
-    idx <- which(flagged_matrix[i, ])
-
-    if (length(idx) == 1) {
-      defining_factor[i] <- factor_names[idx]
-      defining_loading[i] <- loadings_numeric[i, idx]
-      loading_sign[i] <- ifelse(defining_loading[i] >= 0, "positive", "negative")
-    } else if (length(idx) > 1) {
-      defining_factor[i] <- paste(factor_names[idx], collapse = ";")
-      defining_loading[i] <- NA_real_
-      loading_sign[i] <- "confounded"
-    }
-  }
-
-  data.frame(
-    participant = participant,
-    status = status,
-    defining_factor = defining_factor,
-    defining_loading = defining_loading,
-    loading_sign = loading_sign,
-    stringsAsFactors = FALSE
-  )
-}
-
-assign_forced_scores_from_z <- function(z_vector, distribution_vector) {
-  scores_sorted <- sort(distribution_vector, decreasing = TRUE)
-  idx <- order(z_vector, decreasing = TRUE, na.last = TRUE)
-
-  out <- rep(NA_real_, length(z_vector))
-  out[idx] <- scores_sorted
-
-  out
-}
-
-standardize_factor_array <- function(result, metadata, nfactors, distribution_vector) {
-  zsc <- get_component(result, "zsc", 5)
-  zsc_n <- get_component(result, "zsc_n", 6)
-
-  z_df <- select_numeric_factor_columns(zsc, nfactors)
-  names(z_df) <- paste0("F", seq_len(nfactors), "_z")
-
-  score_df <- NULL
-
-  if (!is.null(zsc_n)) {
-    candidate_scores <- safe_as_data_frame(zsc_n)
-    numeric_cols <- vapply(candidate_scores, is.numeric, logical(1))
-
-    if (sum(numeric_cols) >= nfactors) {
-      score_df <- candidate_scores[, which(numeric_cols)[seq_len(nfactors)], drop = FALSE]
-      names(score_df) <- paste0("F", seq_len(nfactors), "_score")
-    }
-  }
-
-  if (is.null(score_df)) {
-    score_df <- as.data.frame(
-      matrix(
-        NA_real_,
-        nrow = nrow(z_df),
-        ncol = nfactors
-      )
-    )
-
-    names(score_df) <- paste0("F", seq_len(nfactors), "_score")
-
-    for (j in seq_len(nfactors)) {
-      score_df[[j]] <- assign_forced_scores_from_z(z_df[[j]], distribution_vector)
-    }
-  }
-
-  out <- cbind(
-    metadata,
-    z_df,
-    score_df,
-    stringsAsFactors = FALSE
-  )
-
-  out
-}
-
-extract_qdc_table <- function(result, q_matrix, nfactors) {
-  if (nfactors < 2) {
     return(NULL)
   }
 
-  qdc_table <- get_component(result, "qdc", 8)
+  out <- x[, which(numeric_cols)[seq_len(nfactors)], drop = FALSE]
+  names(out) <- paste0(prefix, seq_len(nfactors))
 
-  if (!is.null(qdc_table)) {
-    return(as.data.frame(qdc_table, stringsAsFactors = FALSE))
-  }
-
-  zsc <- get_component(result, "zsc", 5)
-  f_char <- get_component(result, "f_char", 7)
-
-  sed <- NULL
-
-  if (!is.null(f_char)) {
-    if (is.list(f_char) && length(f_char) >= 3) {
-      sed <- as.data.frame(f_char[[3]])
-    }
-  }
-
-  if (!is.null(zsc) && !is.null(sed)) {
-    return(as.data.frame(qmethod::qdc(q_matrix, nfactors, zsc, sed)))
-  }
-
-  return(NULL)
+  return(out)
 }
 
+# Escape text for LaTeX.
 latex_escape <- function(x) {
   x <- as.character(x)
   x[is.na(x)] <- ""
@@ -343,9 +236,11 @@ latex_escape <- function(x) {
   x <- gsub("\\^", "\\\\textasciicircum{}", x)
   x <- gsub("~", "\\\\textasciitilde{}", x)
 
-  x
+  return(x)
 }
 
+# Create a simple LaTeX table.
+# This intentionally avoids HTML, Word, or PDF generation.
 latex_table <- function(df, caption = NULL, label = NULL, align = NULL) {
   df <- as.data.frame(df, stringsAsFactors = FALSE)
 
@@ -374,7 +269,7 @@ latex_table <- function(df, caption = NULL, label = NULL, align = NULL) {
   lines <- c(lines, "\\hline")
 
   for (i in seq_len(nrow(df))) {
-    row <- paste(latex_escape(df[i, ]), collapse = " & ")
+    row <- paste(latex_escape(unlist(df[i, ], use.names = FALSE)), collapse = " & ")
     lines <- c(lines, paste0(row, " \\\\"))
   }
 
@@ -382,28 +277,44 @@ latex_table <- function(df, caption = NULL, label = NULL, align = NULL) {
   lines <- c(lines, "\\end{tabular}")
   lines <- c(lines, "\\end{table}")
 
-  paste(lines, collapse = "\n")
+  return(paste(lines, collapse = "\n"))
 }
 
-run_qmethod_solution <- function(q_matrix, nfactors) {
-  rotation <- ifelse(nfactors == 1, "none", rotation_method_multi_factor)
+###############################################################################
+# 4. Q-METHODOLOGY HELPER FUNCTIONS
+###############################################################################
 
+# Run qmethod robustly.
+#
+# The current qmethod interface is typically:
+#   qmethod(dataset, nfactors, extraction = "PCA", rotation = "varimax",
+#           forced = TRUE, distribution = NA, cor.method = "pearson",
+#           silent = FALSE, ...)
+#
+# Older versions may expose nstat/nqsorts or differ slightly, so this function
+# checks formal arguments before passing optional parameters.
+run_qmethod_solution <- function(q_matrix, nfactors) {
   fmls <- names(formals(qmethod::qmethod))
 
   args <- list(
     dataset = as.data.frame(q_matrix),
-    nfactors = nfactors,
-    rotation = rotation,
-    forced = TRUE,
-    cor.method = correlation_method
+    nfactors = nfactors
   )
 
   if ("extraction" %in% fmls) {
     args$extraction <- extraction_method
   }
 
-  if ("distribution" %in% fmls) {
-    args$distribution <- NULL
+  if ("rotation" %in% fmls) {
+    args$rotation <- rotation_method
+  }
+
+  if ("forced" %in% fmls) {
+    args$forced <- TRUE
+  }
+
+  if ("cor.method" %in% fmls) {
+    args$cor.method <- correlation_method
   }
 
   if ("silent" %in% fmls) {
@@ -418,11 +329,318 @@ run_qmethod_solution <- function(q_matrix, nfactors) {
     args$nqsorts <- ncol(q_matrix)
   }
 
-  do.call(qmethod::qmethod, args)
+  # Do not pass distribution unless a non-forced design is needed.
+  # For forced = TRUE, qmethod calculates the distribution automatically
+  # from the observed Q-sort data.
+  result <- do.call(qmethod::qmethod, args)
+
+  return(result)
+}
+
+# Convert qmethod's flagged matrix to a logical matrix with known row/column names.
+as_logical_flag_matrix <- function(x, participants, nfactors) {
+  row_names <- participants
+  col_names <- paste0("F", seq_len(nfactors))
+
+  if (is.null(x)) {
+    out <- matrix(
+      FALSE,
+      nrow = length(row_names),
+      ncol = nfactors,
+      dimnames = list(row_names, col_names)
+    )
+    return(out)
+  }
+
+  x_df <- safe_as_data_frame(x)
+
+  if (is.null(x_df) || ncol(x_df) < nfactors) {
+    out <- matrix(
+      FALSE,
+      nrow = length(row_names),
+      ncol = nfactors,
+      dimnames = list(row_names, col_names)
+    )
+    return(out)
+  }
+
+  x_df <- x_df[, seq_len(nfactors), drop = FALSE]
+  out <- as.matrix(x_df)
+
+  # Force logical interpretation.
+  storage.mode(out) <- "logical"
+
+  rownames(out) <- row_names
+  colnames(out) <- col_names
+
+  return(out)
+}
+
+# Fallback flagging in case qmethod does not return usable flags.
+#
+# This follows a conservative simple rule:
+#   - A Q-sort is defining only if it loads significantly on exactly one factor.
+#   - If it loads significantly on more than one factor, it is confounded.
+#   - If it loads significantly on no factor, it is non-defining.
+#
+# This fallback is not meant to replace qmethod's own qflag() when available.
+fallback_flags_from_loadings <- function(loadings_numeric, threshold) {
+  L <- as.matrix(loadings_numeric)
+  abs_L <- abs(L)
+
+  significant <- abs_L >= threshold
+
+  out <- matrix(
+    FALSE,
+    nrow = nrow(significant),
+    ncol = ncol(significant),
+    dimnames = dimnames(significant)
+  )
+
+  for (i in seq_len(nrow(significant))) {
+    sig_idx <- which(significant[i, ])
+
+    if (length(sig_idx) >= 1) {
+      out[i, sig_idx] <- TRUE
+    }
+  }
+
+  return(out)
+}
+
+# Classify Q-sorts as defining, confounded, or non-defining.
+classify_defining_sorts <- function(loadings_numeric, flagged_matrix) {
+  participants <- rownames(loadings_numeric)
+  factor_names <- colnames(loadings_numeric)
+
+  flag_count <- rowSums(flagged_matrix, na.rm = TRUE)
+
+  status <- ifelse(
+    flag_count == 0,
+    "non_defining",
+    ifelse(flag_count == 1, "defining", "confounded")
+  )
+
+  defining_factor <- rep(NA_character_, length(participants))
+  defining_loading <- rep(NA_real_, length(participants))
+  loading_sign <- rep(NA_character_, length(participants))
+
+  for (i in seq_along(participants)) {
+    idx <- which(flagged_matrix[i, ])
+
+    if (length(idx) == 1) {
+      defining_factor[i] <- factor_names[idx]
+      defining_loading[i] <- as.matrix(loadings_numeric)[i, idx]
+      loading_sign[i] <- ifelse(defining_loading[i] >= 0, "positive", "negative")
+    }
+
+    if (length(idx) > 1) {
+      defining_factor[i] <- paste(factor_names[idx], collapse = ";")
+      defining_loading[i] <- NA_real_
+      loading_sign[i] <- "confounded"
+    }
+  }
+
+  out <- data.frame(
+    participant = participants,
+    status = status,
+    defining_factor = defining_factor,
+    defining_loading = defining_loading,
+    loading_sign = loading_sign,
+    stringsAsFactors = FALSE
+  )
+
+  return(out)
+}
+
+# Assign forced-distribution scores from z-scores.
+#
+# This is used only as a fallback if qmethod does not provide rounded
+# factor scores in a clean numeric table.
+assign_forced_scores_from_z <- function(z_vector, distribution_vector) {
+  scores_sorted <- sort(distribution_vector, decreasing = TRUE)
+  idx <- order(z_vector, decreasing = TRUE, na.last = TRUE)
+
+  out <- rep(NA_real_, length(z_vector))
+  out[idx] <- scores_sorted
+
+  return(out)
+}
+
+# Build a clean factor array table from qmethod outputs.
+#
+# The output includes:
+#   statement_id
+#   statement_text
+#   category
+#   F1_z, F2_z, ...
+#   F1_score, F2_score, ...
+standardize_factor_array <- function(result, metadata, nfactors, distribution_vector) {
+  # qmethod usually stores statement z-scores in result$zsc.
+  zsc_raw <- get_component(result, "zsc", index = 5)
+
+  z_df <- select_numeric_factor_columns(zsc_raw, nfactors, prefix = "F")
+
+  if (is.null(z_df)) {
+    stop(
+      paste0("Could not extract statement z-scores for ", nfactors, "-factor solution."),
+      call. = FALSE
+    )
+  }
+
+  names(z_df) <- paste0("F", seq_len(nfactors), "_z")
+
+  # qmethod usually stores rounded factor scores in result$zsc_n.
+  zsc_n_raw <- get_component(result, "zsc_n", index = 6)
+  score_df <- select_numeric_factor_columns(zsc_n_raw, nfactors, prefix = "F")
+
+  if (!is.null(score_df)) {
+    names(score_df) <- paste0("F", seq_len(nfactors), "_score")
+  }
+
+  # Fallback: assign forced scores by ranking z-scores.
+  if (is.null(score_df)) {
+    score_df <- as.data.frame(
+      matrix(
+        NA_real_,
+        nrow = nrow(z_df),
+        ncol = nfactors
+      )
+    )
+
+    names(score_df) <- paste0("F", seq_len(nfactors), "_score")
+
+    for (j in seq_len(nfactors)) {
+      score_df[[j]] <- assign_forced_scores_from_z(
+        z_vector = z_df[[j]],
+        distribution_vector = distribution_vector
+      )
+    }
+  }
+
+  out <- cbind(
+    metadata,
+    z_df,
+    score_df,
+    stringsAsFactors = FALSE
+  )
+
+  return(out)
+}
+
+# Extract distinguishing / consensus table safely.
+#
+# For nfactors == 1, this is not applicable.
+# For nfactors >= 2, qmethod normally provides result$qdc.
+# The function handles unexpected structures safely.
+extract_qdc_table <- function(result, nfactors) {
+  if (nfactors < 2) {
+    return(NULL)
+  }
+
+  qdc_raw <- get_component(result, "qdc", index = 8)
+
+  qdc_df <- safe_as_data_frame(qdc_raw)
+
+  if (is.null(qdc_df)) {
+    return(NULL)
+  }
+
+  return(qdc_df)
+}
+
+# Count distinguishing and consensus statements from a qdc table.
+#
+# qmethod versions may differ in column names, so this function scans all
+# character columns for likely labels.
+count_qdc_labels <- function(qdc_df) {
+  if (is.null(qdc_df) || nrow(qdc_df) == 0) {
+    return(list(distinguishing = NA_integer_, consensus = NA_integer_))
+  }
+
+  char_cols <- vapply(qdc_df, is.character, logical(1))
+
+  if (!any(char_cols)) {
+    return(list(distinguishing = NA_integer_, consensus = NA_integer_))
+  }
+
+  txt <- unlist(qdc_df[, char_cols, drop = FALSE], use.names = FALSE)
+  txt <- txt[!is.na(txt)]
+
+  n_distinguishing <- sum(grepl("distinguish", txt, ignore.case = TRUE))
+  n_consensus <- sum(grepl("consensus", txt, ignore.case = TRUE))
+
+  return(list(
+    distinguishing = n_distinguishing,
+    consensus = n_consensus
+  ))
+}
+
+# Write a manual, safe, text-only summary of one qmethod result.
+#
+# This replaces print(result) and summary(result), which can crash for 1F
+# because qdc is not defined as a table for a one-factor solution.
+write_safe_qmethod_summary <- function(
+  result,
+  nfactors,
+  solution_label,
+  loadings_export,
+  defining_sorts,
+  factor_array,
+  path
+) {
+  lines <- character(0)
+
+  lines <- c(lines, paste0("qmethod solution: ", solution_label))
+  lines <- c(lines, paste0("Number of factors: ", nfactors))
+  lines <- c(lines, paste0("Extraction method: ", extraction_method))
+  lines <- c(lines, paste0("Rotation argument passed to qmethod: ", rotation_method))
+
+  if (nfactors == 1) {
+    lines <- c(
+      lines,
+      "",
+      "Note: This is a 1-factor solution.",
+      "Distinguishing and consensus statements are not applicable because there is only one factor.",
+      "Direct print(result) and summary(result) are intentionally skipped to avoid qmethod print-method errors when qdc is not table-like."
+    )
+  } else {
+    lines <- c(
+      lines,
+      "",
+      "Note: This is a multi-factor solution.",
+      "Distinguishing and consensus statements are applicable if qmethod returned a qdc table."
+    )
+  }
+
+  lines <- c(lines, "", "Available qmethod result components:")
+  lines <- c(lines, paste(names(result), collapse = ", "))
+
+  lines <- c(lines, "", "Loadings:")
+  lines <- c(lines, capture.output(print(loadings_export)))
+
+  lines <- c(lines, "", "Defining-sort classification:")
+  lines <- c(lines, capture.output(print(defining_sorts)))
+
+  lines <- c(lines, "", "Factor array preview:")
+  preview_cols <- c("statement_id", "statement_text", "category")
+  z_cols <- grep("_z$", names(factor_array), value = TRUE)
+  score_cols <- grep("_score$", names(factor_array), value = TRUE)
+  preview_cols <- c(preview_cols, z_cols, score_cols)
+  preview <- head(factor_array[, preview_cols, drop = FALSE], 10)
+  lines <- c(lines, capture.output(print(preview)))
+
+  f_char <- get_component(result, "f_char", index = 7)
+  if (!is.null(f_char)) {
+    lines <- c(lines, "", "Factor characteristics:")
+    lines <- c(lines, safe_capture_print(f_char))
+  }
+
+  writeLines(lines, con = path, useBytes = TRUE)
 }
 
 ###############################################################################
-# 4. READ INPUT CSV
+# 5. READ INPUT CSV
 ###############################################################################
 
 if (!file.exists(input_file)) {
@@ -440,7 +658,7 @@ raw_data <- utils::read.csv(
 )
 
 ###############################################################################
-# 5. VALIDATE STRUCTURE
+# 6. VALIDATE STRUCTURE
 ###############################################################################
 
 validation_messages <- character(0)
@@ -448,7 +666,9 @@ validation_pass <- TRUE
 
 required_metadata_cols <- c("statement_id", "statement_text", "category")
 
+# Check metadata columns.
 missing_metadata <- setdiff(required_metadata_cols, names(raw_data))
+
 if (length(missing_metadata) > 0) {
   validation_pass <- FALSE
   validation_messages <- c(
@@ -460,7 +680,9 @@ if (length(missing_metadata) > 0) {
   )
 }
 
+# Check participant columns.
 missing_participants <- setdiff(expected_participants, names(raw_data))
+
 if (length(missing_participants) > 0) {
   validation_pass <- FALSE
   validation_messages <- c(
@@ -472,6 +694,7 @@ if (length(missing_participants) > 0) {
   )
 }
 
+# Check number of statements.
 if (nrow(raw_data) != expected_n_statements) {
   validation_pass <- FALSE
   validation_messages <- c(
@@ -486,32 +709,7 @@ if (nrow(raw_data) != expected_n_statements) {
   )
 }
 
-if ("statement_id" %in% names(raw_data)) {
-  if (any(is.na(raw_data$statement_id) | raw_data$statement_id == "")) {
-    validation_pass <- FALSE
-    validation_messages <- c(validation_messages, "Missing statement_id value(s).")
-  }
-
-  if (any(duplicated(raw_data$statement_id))) {
-    validation_pass <- FALSE
-    validation_messages <- c(validation_messages, "Duplicated statement_id value(s).")
-  }
-}
-
-if ("statement_text" %in% names(raw_data)) {
-  if (any(is.na(raw_data$statement_text) | raw_data$statement_text == "")) {
-    validation_pass <- FALSE
-    validation_messages <- c(validation_messages, "Missing statement_text value(s).")
-  }
-}
-
-if ("category" %in% names(raw_data)) {
-  if (any(is.na(raw_data$category) | raw_data$category == "")) {
-    validation_pass <- FALSE
-    validation_messages <- c(validation_messages, "Missing category value(s).")
-  }
-}
-
+# Stop early if critical columns are missing.
 if (!all(c(required_metadata_cols, expected_participants) %in% names(raw_data))) {
   validation_report <- data.frame(
     check = "CSV structure",
@@ -520,7 +718,7 @@ if (!all(c(required_metadata_cols, expected_participants) %in% names(raw_data)))
     stringsAsFactors = FALSE
   )
 
-  write_csv(
+  write_csv_utf8(
     validation_report,
     file.path(output_dir, "validation", "input_validation_report.csv")
   )
@@ -535,18 +733,45 @@ if (!all(c(required_metadata_cols, expected_participants) %in% names(raw_data)))
 }
 
 ###############################################################################
-# 6. SEPARATE METADATA AND Q-SORT MATRIX
+# 7. SEPARATE METADATA AND RAW Q-SORT DATA
 ###############################################################################
 
 metadata <- raw_data[, required_metadata_cols, drop = FALSE]
-
 q_data_raw <- raw_data[, expected_participants, drop = FALSE]
+
+# Validate statement IDs.
+if (any(is.na(metadata$statement_id) | metadata$statement_id == "")) {
+  validation_pass <- FALSE
+  validation_messages <- c(validation_messages, "Missing statement_id value(s).")
+}
+
+if (any(duplicated(metadata$statement_id))) {
+  validation_pass <- FALSE
+  validation_messages <- c(validation_messages, "Duplicated statement_id value(s).")
+}
+
+# Validate statement text.
+if (any(is.na(metadata$statement_text) | metadata$statement_text == "")) {
+  validation_pass <- FALSE
+  validation_messages <- c(validation_messages, "Missing statement_text value(s).")
+}
+
+# Validate category.
+if (any(is.na(metadata$category) | metadata$category == "")) {
+  validation_pass <- FALSE
+  validation_messages <- c(validation_messages, "Missing category value(s).")
+}
+
+###############################################################################
+# 8. CONVERT Q-SORT DATA TO NUMERIC MATRIX
+###############################################################################
 
 q_data_numeric <- as.data.frame(
   lapply(q_data_raw, function(x) suppressWarnings(as.numeric(as.character(x)))),
   stringsAsFactors = FALSE
 )
 
+# Identify cells that failed numeric conversion.
 non_numeric_cells <- is.na(q_data_numeric) & !is.na(q_data_raw)
 
 if (any(non_numeric_cells)) {
@@ -557,6 +782,7 @@ if (any(non_numeric_cells)) {
   )
 }
 
+# Identify missing Q-sort scores.
 if (any(is.na(q_data_numeric))) {
   validation_pass <- FALSE
   validation_messages <- c(
@@ -565,6 +791,7 @@ if (any(is.na(q_data_numeric))) {
   )
 }
 
+# Allowed scores.
 allowed_scores <- sort(unique(expected_distribution))
 
 invalid_score_mask <- !(as.matrix(q_data_numeric) %in% allowed_scores)
@@ -581,7 +808,10 @@ if (any(invalid_score_mask, na.rm = TRUE)) {
   )
 }
 
-integer_score_mask <- abs(as.matrix(q_data_numeric) - round(as.matrix(q_data_numeric))) > .Machine$double.eps^0.5
+# Check integer scores.
+integer_score_mask <- abs(
+  as.matrix(q_data_numeric) - round(as.matrix(q_data_numeric))
+) > .Machine$double.eps^0.5
 
 if (any(integer_score_mask, na.rm = TRUE)) {
   validation_pass <- FALSE
@@ -591,6 +821,7 @@ if (any(integer_score_mask, na.rm = TRUE)) {
   )
 }
 
+# Create numeric Q matrix.
 q_matrix <- as.matrix(q_data_numeric)
 storage.mode(q_matrix) <- "numeric"
 
@@ -598,10 +829,12 @@ rownames(q_matrix) <- as.character(metadata$statement_id)
 colnames(q_matrix) <- expected_participants
 
 ###############################################################################
-# 7. VALIDATE FORCED DISTRIBUTION
+# 9. VALIDATE FORCED DISTRIBUTION
 ###############################################################################
 
-expected_counts <- as.integer(table(factor(expected_distribution, levels = allowed_scores)))
+expected_counts <- as.integer(
+  table(factor(expected_distribution, levels = allowed_scores))
+)
 
 distribution_check <- data.frame(
   score = allowed_scores,
@@ -613,21 +846,11 @@ for (participant in expected_participants) {
   observed_counts <- as.integer(
     table(factor(q_matrix[, participant], levels = allowed_scores))
   )
+
   distribution_check[[participant]] <- observed_counts
 }
 
-distribution_check$status <- apply(
-  distribution_check[, expected_participants, drop = FALSE],
-  1,
-  function(x) {
-    if (all(x == distribution_check$expected)) {
-      "PASS"
-    } else {
-      "FAIL"
-    }
-  }
-)
-
+# Status by participant.
 participant_distribution_status <- data.frame(
   participant = expected_participants,
   status = NA_character_,
@@ -664,12 +887,31 @@ if (any(participant_distribution_status$status != "PASS")) {
   )
 }
 
-write_csv(
+# Status by score across participants.
+distribution_check$status_by_score <- apply(
+  distribution_check[, expected_participants, drop = FALSE],
+  1,
+  function(x) {
+    if (all(x == distribution_check$expected[seq_along(x)])) {
+      "PASS"
+    } else {
+      # This row-level check is less important than participant-level status.
+      # It is kept only as a diagnostic.
+      "CHECK_PARTICIPANT_COLUMNS"
+    }
+  }
+)
+
+###############################################################################
+# 10. WRITE VALIDATION OUTPUTS
+###############################################################################
+
+write_csv_utf8(
   distribution_check,
   file.path(output_dir, "validation", "qsort_distribution_check.csv")
 )
 
-write_csv(
+write_csv_utf8(
   participant_distribution_status,
   file.path(output_dir, "validation", "participant_distribution_status.csv")
 )
@@ -683,6 +925,7 @@ validation_report <- data.frame(
     "statement_text",
     "category",
     "qsort_numeric",
+    "qsort_missing_values",
     "qsort_allowed_scores",
     "qsort_integer_scores",
     "forced_distribution"
@@ -695,6 +938,7 @@ validation_report <- data.frame(
     ifelse(!any(is.na(metadata$statement_text) | metadata$statement_text == ""), "PASS", "FAIL"),
     ifelse(!any(is.na(metadata$category) | metadata$category == ""), "PASS", "FAIL"),
     ifelse(!any(non_numeric_cells), "PASS", "FAIL"),
+    ifelse(!any(is.na(q_data_numeric)), "PASS", "FAIL"),
     ifelse(!any(invalid_score_mask, na.rm = TRUE), "PASS", "FAIL"),
     ifelse(!any(integer_score_mask, na.rm = TRUE), "PASS", "FAIL"),
     ifelse(all(participant_distribution_status$status == "PASS"), "PASS", "FAIL")
@@ -711,7 +955,7 @@ if (length(validation_messages) > 0) {
   )
 }
 
-write_csv(
+write_csv_utf8(
   validation_report,
   file.path(output_dir, "validation", "input_validation_report.csv")
 )
@@ -732,6 +976,7 @@ writeLines(
   useBytes = TRUE
 )
 
+# Stop before qmethod if validation failed.
 if (!validation_pass) {
   stop(
     paste0(
@@ -743,30 +988,33 @@ if (!validation_pass) {
 }
 
 ###############################################################################
-# 8. EXPORT PREPARED METADATA AND Q-MATRIX
+# 11. EXPORT PREPARED METADATA AND Q MATRIX
 ###############################################################################
 
-write_csv(
+write_csv_utf8(
   metadata,
   file.path(output_dir, "validation", "statement_metadata.csv")
 )
 
-write_csv(
+write_csv_utf8(
   data.frame(statement_id = rownames(q_matrix), q_matrix, check.names = FALSE),
   file.path(output_dir, "validation", "q_matrix_numeric.csv")
 )
 
 ###############################################################################
-# 9. PARTICIPANT CORRELATION MATRIX
+# 12. PARTICIPANT CORRELATION MATRIX
 ###############################################################################
 
+# In Q methodology, participants/Q-sorts are correlated with each other.
+# Since q_matrix columns are participants and rows are statements, cor(q_matrix)
+# gives the participant-by-participant correlation matrix.
 participant_correlation_matrix <- cor(
   q_matrix,
   method = correlation_method,
   use = "pairwise.complete.obs"
 )
 
-write_csv(
+write_csv_utf8(
   data.frame(
     participant = rownames(participant_correlation_matrix),
     participant_correlation_matrix,
@@ -776,7 +1024,7 @@ write_csv(
 )
 
 ###############################################################################
-# 10. RUN QMETHOD SOLUTIONS
+# 13. RUN QMETHOD SOLUTIONS
 ###############################################################################
 
 solution_summaries <- list()
@@ -787,7 +1035,27 @@ for (nf in factor_solutions) {
 
   message("Running qmethod solution: ", solution_label)
 
-  result <- run_qmethod_solution(q_matrix, nfactors = nf)
+  ###########################################################################
+  # 13.1 Run qmethod safely
+  ###########################################################################
+
+  result <- tryCatch(
+    {
+      run_qmethod_solution(q_matrix, nfactors = nf)
+    },
+    error = function(e) {
+      stop(
+        paste0(
+          "qmethod failed for solution ",
+          solution_label,
+          ". Error: ",
+          conditionMessage(e)
+        ),
+        call. = FALSE
+      )
+    }
+  )
+
   all_results[[solution_label]] <- result
 
   saveRDS(
@@ -795,44 +1063,44 @@ for (nf in factor_solutions) {
     file = file.path(output_dir, "rds", paste0("qmethod_result_", solution_label, ".rds"))
   )
 
-  captured_summary <- capture.output({
-    print(result)
-    cat("\n\n")
-    suppressWarnings(print(summary(result)))
-  })
+  ###########################################################################
+  # 13.2 Extract loadings
+  ###########################################################################
 
-  writeLines(
-    captured_summary,
-    con = file.path(output_dir, "factor_solutions", paste0("qmethod_summary_", solution_label, ".txt")),
-    useBytes = TRUE
+  # qmethod usually stores loadings in result$loa.
+  loa_raw <- get_component(result, "loa", index = 3)
+  loadings_numeric <- select_numeric_factor_columns(
+    loa_raw,
+    nfactors = nf,
+    prefix = "F"
   )
 
-  ###########################################################################
-  # 10.1 EXPORT LOADINGS
-  ###########################################################################
-
-  loa_raw <- get_component(result, "loa", 3)
-  loa_df <- safe_as_data_frame(loa_raw)
-
-  if (is.null(loa_df)) {
-    stop(paste0("Could not extract loadings for solution ", solution_label), call. = FALSE)
+  if (is.null(loadings_numeric)) {
+    stop(
+      paste0("Could not extract loadings for solution ", solution_label, "."),
+      call. = FALSE
+    )
   }
 
-  loadings_numeric <- select_numeric_factor_columns(loa_df, nf)
   rownames(loadings_numeric) <- expected_participants
+  names(loadings_numeric) <- paste0("F", seq_len(nf))
 
-  flagged_raw <- get_component(result, "flagged", 4)
-  flagged_matrix <- as_logical_matrix(
-    flagged_raw,
-    nrow_expected = length(expected_participants),
-    ncol_expected = nf,
-    row_names = expected_participants,
-    col_names = paste0("F", seq_len(nf))
+  ###########################################################################
+  # 13.3 Extract or reconstruct qmethod flags
+  ###########################################################################
+
+  flagged_raw <- get_component(result, "flagged", index = 4)
+
+  flagged_matrix <- as_logical_flag_matrix(
+    x = flagged_raw,
+    participants = expected_participants,
+    nfactors = nf
   )
 
+  # If no usable flagging was returned, use the fallback threshold rule.
   if (all(flagged_matrix == FALSE)) {
     flagged_matrix <- fallback_flags_from_loadings(
-      loadings_numeric,
+      loadings_numeric = loadings_numeric,
       threshold = loading_significance_threshold
     )
   }
@@ -848,13 +1116,13 @@ for (nf in factor_solutions) {
     stringsAsFactors = FALSE
   )
 
-  write_csv(
+  write_csv_utf8(
     loadings_export,
     file.path(output_dir, "factor_solutions", paste0("loadings_", solution_label, ".csv"))
   )
 
   ###########################################################################
-  # 10.2 EXPORT DEFINING SORTS
+  # 13.4 Classify defining, confounded, and non-defining sorts
   ###########################################################################
 
   defining_sorts <- classify_defining_sorts(
@@ -862,29 +1130,27 @@ for (nf in factor_solutions) {
     flagged_matrix = flagged_matrix
   )
 
-  write_csv(
+  write_csv_utf8(
     defining_sorts,
     file.path(output_dir, "factor_solutions", paste0("defining_sorts_", solution_label, ".csv"))
   )
 
   ###########################################################################
-  # 10.3 EXPORT FACTOR CHARACTERISTICS IF AVAILABLE
+  # 13.5 Export factor characteristics if available
   ###########################################################################
 
-  f_char <- get_component(result, "f_char", 7)
+  f_char <- get_component(result, "f_char", index = 7)
 
   if (!is.null(f_char)) {
-    f_char_capture <- capture.output(print(f_char))
-
     writeLines(
-      f_char_capture,
+      safe_capture_print(f_char),
       con = file.path(output_dir, "factor_solutions", paste0("factor_characteristics_", solution_label, ".txt")),
       useBytes = TRUE
     )
   }
 
   ###########################################################################
-  # 10.4 EXPORT FACTOR ARRAYS
+  # 13.6 Build and export factor arrays
   ###########################################################################
 
   factor_array <- standardize_factor_array(
@@ -894,11 +1160,12 @@ for (nf in factor_solutions) {
     distribution_vector = expected_distribution
   )
 
-  write_csv(
+  write_csv_utf8(
     factor_array,
     file.path(output_dir, "factor_arrays", paste0("factor_arrays_", solution_label, ".csv"))
   )
 
+  # Export one ranked table per factor.
   for (j in seq_len(nf)) {
     f_name <- paste0("F", j)
     score_col <- paste0(f_name, "_score")
@@ -910,14 +1177,18 @@ for (nf in factor_solutions) {
       drop = FALSE
     ]
 
-    write_csv(
+    write_csv_utf8(
       ranked_array,
-      file.path(output_dir, "factor_arrays", paste0("factor_array_", solution_label, "_", f_name, "_ranked.csv"))
+      file.path(
+        output_dir,
+        "factor_arrays",
+        paste0("factor_array_", solution_label, "_", f_name, "_ranked.csv")
+      )
     )
   }
 
   ###########################################################################
-  # 10.5 EXPORT DISTINGUISHING / CONSENSUS STATEMENTS
+  # 13.7 Export distinguishing and consensus statements where applicable
   ###########################################################################
 
   qdc_export <- NULL
@@ -927,64 +1198,98 @@ for (nf in factor_solutions) {
   if (nf >= 2) {
     qdc_table <- extract_qdc_table(
       result = result,
-      q_matrix = q_matrix,
       nfactors = nf
     )
 
     if (!is.null(qdc_table)) {
+      # If qdc has one row per statement, attach metadata.
       if (nrow(qdc_table) == nrow(metadata)) {
         qdc_export <- cbind(metadata, qdc_table, stringsAsFactors = FALSE)
       } else {
         qdc_export <- qdc_table
       }
 
-      write_csv(
+      write_csv_utf8(
         qdc_export,
-        file.path(output_dir, "distinguishing_consensus", paste0("distinguishing_consensus_", solution_label, ".csv"))
+        file.path(
+          output_dir,
+          "distinguishing_consensus",
+          paste0("distinguishing_consensus_", solution_label, ".csv")
+        )
       )
 
-      if ("dist.and.cons" %in% names(qdc_export)) {
-        n_distinguishing <- sum(
-          grepl("Distinguishes", qdc_export$dist.and.cons),
-          na.rm = TRUE
-        )
-
-        n_consensus <- sum(
-          qdc_export$dist.and.cons == "Consensus",
-          na.rm = TRUE
-        )
-      }
+      qdc_counts <- count_qdc_labels(qdc_export)
+      n_distinguishing <- qdc_counts$distinguishing
+      n_consensus <- qdc_counts$consensus
     } else {
       writeLines(
         "Distinguishing / consensus table could not be extracted from qmethod result.",
-        con = file.path(output_dir, "distinguishing_consensus", paste0("distinguishing_consensus_", solution_label, "_not_available.txt")),
+        con = file.path(
+          output_dir,
+          "distinguishing_consensus",
+          paste0("distinguishing_consensus_", solution_label, "_not_available.txt")
+        ),
         useBytes = TRUE
       )
     }
   } else {
     writeLines(
-      "Not applicable for a 1-factor solution.",
-      con = file.path(output_dir, "distinguishing_consensus", "distinguishing_consensus_1F_not_applicable.txt"),
+      c(
+        "Not applicable for a 1-factor solution.",
+        "There are no between-factor comparisons when only one factor is extracted."
+      ),
+      con = file.path(
+        output_dir,
+        "distinguishing_consensus",
+        "distinguishing_consensus_1F_not_applicable.txt"
+      ),
       useBytes = TRUE
     )
   }
 
   ###########################################################################
-  # 10.6 SOLUTION DIAGNOSTICS
+  # 13.8 Write safe text summary for this qmethod solution
   ###########################################################################
 
+  write_safe_qmethod_summary(
+    result = result,
+    nfactors = nf,
+    solution_label = solution_label,
+    loadings_export = loadings_export,
+    defining_sorts = defining_sorts,
+    factor_array = factor_array,
+    path = file.path(
+      output_dir,
+      "factor_solutions",
+      paste0("qmethod_safe_summary_", solution_label, ".txt")
+    )
+  )
+
+  ###########################################################################
+  # 13.9 Solution diagnostics
+  ###########################################################################
+
+  # Eigenvalues can be approximated from rotated loadings as column sums of
+  # squared factor loadings. This is mainly a comparative diagnostic here.
   eigenvalues <- colSums(as.matrix(loadings_numeric)^2, na.rm = TRUE)
   variance_percent <- 100 * eigenvalues / ncol(q_matrix)
   total_variance_percent <- sum(variance_percent, na.rm = TRUE)
 
-  unique_defining <- defining_sorts$status == "defining"
-  n_defining_total <- sum(unique_defining, na.rm = TRUE)
+  n_defining_total <- sum(defining_sorts$status == "defining", na.rm = TRUE)
   n_confounded <- sum(defining_sorts$status == "confounded", na.rm = TRUE)
   n_non_defining <- sum(defining_sorts$status == "non_defining", na.rm = TRUE)
 
+  factor_names <- paste0("F", seq_len(nf))
+
   defining_per_factor <- sapply(
-    paste0("F", seq_len(nf)),
-    function(f) sum(defining_sorts$defining_factor == f & defining_sorts$status == "defining", na.rm = TRUE)
+    factor_names,
+    function(f) {
+      sum(
+        defining_sorts$status == "defining" &
+          defining_sorts$defining_factor == f,
+        na.rm = TRUE
+      )
+    }
   )
 
   factors_with_two_or_more_defining <- sum(defining_per_factor >= 2)
@@ -1023,7 +1328,12 @@ for (nf in factor_solutions) {
     solution = solution_label,
     nfactors = nf,
     extraction = extraction_method,
-    rotation = ifelse(nf == 1, "none", rotation_method_multi_factor),
+    rotation_argument = rotation_method,
+    rotation_note = ifelse(
+      nf == 1,
+      "Rotation has no substantive role for a one-factor solution.",
+      "Varimax rotation used."
+    ),
     total_variance_percent = round(total_variance_percent, 2),
     eigenvalues = paste(round(eigenvalues, 3), collapse = "; "),
     variance_percent_by_factor = paste(round(variance_percent, 2), collapse = "; "),
@@ -1035,26 +1345,34 @@ for (nf in factor_solutions) {
       collapse = "; "
     ),
     factors_with_two_or_more_defining_sorts = factors_with_two_or_more_defining,
-    distinguishing_statements = ifelse(is.na(n_distinguishing), "NA", as.character(n_distinguishing)),
-    consensus_statements = ifelse(is.na(n_consensus), "NA", as.character(n_consensus)),
+    distinguishing_statements = ifelse(
+      is.na(n_distinguishing),
+      "NA",
+      as.character(n_distinguishing)
+    ),
+    consensus_statements = ifelse(
+      is.na(n_consensus),
+      "NA",
+      as.character(n_consensus)
+    ),
     warning_flags = paste(warning_flags, collapse = "; "),
     stringsAsFactors = FALSE
   )
 }
 
 ###############################################################################
-# 11. EXPORT SOLUTION COMPARISON TABLE
+# 14. EXPORT SOLUTION COMPARISON TABLE
 ###############################################################################
 
 solution_comparison <- do.call(rbind, solution_summaries)
 
-write_csv(
+write_csv_utf8(
   solution_comparison,
   file.path(output_dir, "reports", "solution_comparison_table.csv")
 )
 
 ###############################################################################
-# 12. GENERATE STRICT LATEX REPORT
+# 15. GENERATE STRICT LATEX REPORT
 ###############################################################################
 
 distribution_latex_table <- data.frame(
@@ -1082,17 +1400,25 @@ solution_latex_table <- solution_comparison[, c(
 generated_files <- data.frame(
   file = c(
     file.path(output_dir, "validation", "input_validation_report.csv"),
+    file.path(output_dir, "validation", "input_validation_report.txt"),
     file.path(output_dir, "validation", "qsort_distribution_check.csv"),
+    file.path(output_dir, "validation", "participant_distribution_status.csv"),
+    file.path(output_dir, "validation", "statement_metadata.csv"),
     file.path(output_dir, "validation", "q_matrix_numeric.csv"),
     file.path(output_dir, "correlations", "participant_correlation_matrix.csv"),
     file.path(output_dir, "factor_solutions", "loadings_1F.csv"),
     file.path(output_dir, "factor_solutions", "loadings_2F.csv"),
     file.path(output_dir, "factor_solutions", "loadings_3F.csv"),
     file.path(output_dir, "factor_solutions", "loadings_4F.csv"),
+    file.path(output_dir, "factor_solutions", "defining_sorts_1F.csv"),
+    file.path(output_dir, "factor_solutions", "defining_sorts_2F.csv"),
+    file.path(output_dir, "factor_solutions", "defining_sorts_3F.csv"),
+    file.path(output_dir, "factor_solutions", "defining_sorts_4F.csv"),
     file.path(output_dir, "factor_arrays", "factor_arrays_1F.csv"),
     file.path(output_dir, "factor_arrays", "factor_arrays_2F.csv"),
     file.path(output_dir, "factor_arrays", "factor_arrays_3F.csv"),
     file.path(output_dir, "factor_arrays", "factor_arrays_4F.csv"),
+    file.path(output_dir, "distinguishing_consensus", "distinguishing_consensus_1F_not_applicable.txt"),
     file.path(output_dir, "distinguishing_consensus", "distinguishing_consensus_2F.csv"),
     file.path(output_dir, "distinguishing_consensus", "distinguishing_consensus_3F.csv"),
     file.path(output_dir, "distinguishing_consensus", "distinguishing_consensus_4F.csv"),
@@ -1126,8 +1452,9 @@ latex_lines <- c(
   paste0("Number of Q-sorts: ", length(expected_participants), "\\\\"),
   paste0("Participants: \\texttt{", latex_escape(paste(expected_participants, collapse = ", ")), "}\\\\"),
   paste0("Extraction method: \\texttt{", latex_escape(extraction_method), "}\\\\"),
-  paste0("Rotation for multi-factor solutions: \\texttt{", latex_escape(rotation_method_multi_factor), "}\\\\"),
+  paste0("Rotation argument passed to \\texttt{qmethod}: \\texttt{", latex_escape(rotation_method), "}\\\\"),
   paste0("Correlation method: \\texttt{", latex_escape(correlation_method), "}\\\\"),
+  paste0("Significant loading threshold used for fallback diagnostics: $\\pm ", round(loading_significance_threshold, 3), "$\\\\"),
   "",
   "\\section*{Validation summary}",
   latex_table(
@@ -1166,6 +1493,8 @@ latex_lines <- c(
   "",
   "A one-factor solution is acceptable when it represents a coherent dominant shared viewpoint and additional factors do not add stable or interpretable perspectives. Multi-factor solutions are preferable only when each retained factor is statistically and substantively defensible.",
   "",
+  "For the one-factor solution, distinguishing and consensus statements are not applicable because there are no between-factor comparisons.",
+  "",
   "\\section*{Generated output files}",
   "\\begin{longtable}{p{0.95\\textwidth}}",
   "\\toprule",
@@ -1187,12 +1516,11 @@ writeLines(
 )
 
 ###############################################################################
-# 13. FINAL MESSAGE
+# 16. FINAL MESSAGE
 ###############################################################################
 
 message("Q-methodology workflow completed successfully.")
 message("Solution comparison CSV: ", file.path(output_dir, "reports", "solution_comparison_table.csv"))
 message("Strict LaTeX report: ", latex_report_path)
-
 
   
